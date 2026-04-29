@@ -362,6 +362,28 @@ struct Source {
                                 // field on phantom surface
     int iyinl, iyinu;        // lower and upper y-bounds indices of the
                                 // field on phantom surface
+
+    /* Rotated-beam mode (qdc Phase 2 slice 2e). When rotated_beam == 0,
+     * the legacy ssd-based geometry above is used unchanged. When 1,
+     * the source can sit at an arbitrary 3D position and the beam axis
+     * can point in any direction; particles are injected from
+     * source_pos toward a sample point on the iso plane and ray-box
+     * intersected with the phantom AABB to find the entry voxel.
+     *
+     * In rotated_beam mode, xinl/xinu/yinl/yinu are reinterpreted as
+     * collimator bounds in the iso plane (perpendicular to beam_axis),
+     * not on the phantom surface. Distances are cm.
+     *
+     * cright and cup are unit vectors spanning the iso plane:
+     *   target = iso + px*cright + py*cup     for px,py in [xinl,xinu]
+     *                                              x [yinl,yinu]
+     */
+    int rotated_beam;
+    double source_pos[3];     /* cm, IEC frame */
+    double beam_axis[3];      /* unit vector from source toward iso */
+    double iso[3];            /* cm, IEC frame */
+    double cright[3];         /* in-beam +x basis (unit, perp beam_axis) */
+    double cup[3];            /* in-beam +y basis (unit, perp beam_axis) */
 };
 struct Source source;
 
@@ -627,7 +649,60 @@ void initSource() {
         printf("Sizes :\n");
         printf("\t x (cm) = %f, y (cm) = %f\n", source.xsize, source.ysize);
     }
-    
+
+    /* Optional rotated-beam mode (qdc Phase 2 slice 2e). Activated if a
+     * `source position` key is present. All vectors are in the same IEC
+     * frame as the phantom voxel grid. */
+    source.rotated_beam = 0;
+    if (getInputValue(buffer, "source position") == 1) {
+        if (sscanf(buffer, "%lf %lf %lf",
+                   &source.source_pos[0],
+                   &source.source_pos[1],
+                   &source.source_pos[2]) != 3) {
+            printf("Malformed 'source position'; expected 'sx sy sz'.\n");
+            exit(EXIT_FAILURE);
+        }
+        if (getInputValue(buffer, "isocenter") != 1 ||
+            sscanf(buffer, "%lf %lf %lf",
+                   &source.iso[0], &source.iso[1], &source.iso[2]) != 3) {
+            printf("rotated_beam: missing 'isocenter = ix iy iz'.\n");
+            exit(EXIT_FAILURE);
+        }
+        if (getInputValue(buffer, "collimator right") != 1 ||
+            sscanf(buffer, "%lf %lf %lf",
+                   &source.cright[0], &source.cright[1], &source.cright[2]) != 3) {
+            printf("rotated_beam: missing 'collimator right = rx ry rz'.\n");
+            exit(EXIT_FAILURE);
+        }
+        if (getInputValue(buffer, "collimator up") != 1 ||
+            sscanf(buffer, "%lf %lf %lf",
+                   &source.cup[0], &source.cup[1], &source.cup[2]) != 3) {
+            printf("rotated_beam: missing 'collimator up = ux uy uz'.\n");
+            exit(EXIT_FAILURE);
+        }
+        double bx = source.iso[0] - source.source_pos[0];
+        double by = source.iso[1] - source.source_pos[1];
+        double bz = source.iso[2] - source.source_pos[2];
+        double bn = sqrt(bx*bx + by*by + bz*bz);
+        if (bn <= 0.0) {
+            printf("rotated_beam: source and isocenter coincide.\n");
+            exit(EXIT_FAILURE);
+        }
+        source.beam_axis[0] = bx / bn;
+        source.beam_axis[1] = by / bn;
+        source.beam_axis[2] = bz / bn;
+        source.rotated_beam = 1;
+        if (verbose_flag) {
+            printf("Rotated-beam mode enabled.\n");
+            printf("\t source = (%.4f, %.4f, %.4f)\n",
+                   source.source_pos[0], source.source_pos[1], source.source_pos[2]);
+            printf("\t iso    = (%.4f, %.4f, %.4f)\n",
+                   source.iso[0], source.iso[1], source.iso[2]);
+            printf("\t axis   = (%.4f, %.4f, %.4f)\n",
+                   source.beam_axis[0], source.beam_axis[1], source.beam_axis[2]);
+        }
+    }
+
     return;
 }
 
@@ -1001,6 +1076,120 @@ void initHistory() {
      calculations */
     score.ensrc += ein;
            
+    /* Rotated-beam mode (slice 2e). Sample on the iso plane, ray-box
+     * intersect into the phantom AABB, set entry voxel's region. */
+    if (source.rotated_beam) {
+        double px = 0.0, py = 0.0;
+        double tx = 0.0, ty = 0.0, tz = 0.0;
+        double ux = 0.0, uy = 0.0, uz = 0.0;
+        double rxyz_iso = 0.0, fw = 0.0, rnno3 = 0.0;
+        int accepted = 0;
+        /* Try at most a few times in case the collimator is set up so
+         * that some samples miss the phantom AABB. In normal clinical
+         * setups every sample hits, so this loop is dominated by the
+         * cosine-cubed acceptance. */
+        for (int attempt = 0; attempt < 100 && !accepted; attempt++) {
+            rnno3 = setRandom();
+            px = rnno3 * (source.xinu - source.xinl) + source.xinl;
+            rnno3 = setRandom();
+            py = rnno3 * (source.yinu - source.yinl) + source.yinl;
+            tx = source.iso[0] + px*source.cright[0] + py*source.cup[0];
+            ty = source.iso[1] + px*source.cright[1] + py*source.cup[1];
+            tz = source.iso[2] + px*source.cright[2] + py*source.cup[2];
+            double dx = tx - source.source_pos[0];
+            double dy = ty - source.source_pos[1];
+            double dz = tz - source.source_pos[2];
+            rxyz_iso = sqrt(dx*dx + dy*dy + dz*dz);
+            if (rxyz_iso == 0.0) continue;
+            ux = dx / rxyz_iso;
+            uy = dy / rxyz_iso;
+            uz = dz / rxyz_iso;
+            double cos_t = ux*source.beam_axis[0]
+                         + uy*source.beam_axis[1]
+                         + uz*source.beam_axis[2];
+            fw = cos_t * cos_t * cos_t;
+            rnno3 = setRandom();
+            if (rnno3 >= fw) continue;
+
+            /* Ray-box intersect with phantom AABB (slab method). */
+            double sx = source.source_pos[0];
+            double sy = source.source_pos[1];
+            double sz = source.source_pos[2];
+            double xmin = geometry.xbounds[0];
+            double xmax = geometry.xbounds[geometry.isize];
+            double ymin = geometry.ybounds[0];
+            double ymax = geometry.ybounds[geometry.jsize];
+            double zmin = geometry.zbounds[0];
+            double zmax = geometry.zbounds[geometry.ksize];
+            double tmin = -1e300, tmax = 1e300;
+            for (int axis = 0; axis < 3; axis++) {
+                double o = (axis == 0) ? sx : (axis == 1) ? sy : sz;
+                double d = (axis == 0) ? ux : (axis == 1) ? uy : uz;
+                double lo = (axis == 0) ? xmin : (axis == 1) ? ymin : zmin;
+                double hi = (axis == 0) ? xmax : (axis == 1) ? ymax : zmax;
+                if (fabs(d) < 1e-12) {
+                    if (o < lo || o > hi) { tmax = -1.0; break; }
+                    continue;
+                }
+                double t1 = (lo - o) / d;
+                double t2 = (hi - o) / d;
+                if (t1 > t2) { double s = t1; t1 = t2; t2 = s; }
+                if (t1 > tmin) tmin = t1;
+                if (t2 < tmax) tmax = t2;
+                if (tmax < tmin) break;
+            }
+            if (tmax < 0.0 || tmax < tmin) {
+                /* Ray misses the phantom from the source position. Try
+                 * another sample. */
+                continue;
+            }
+            double t_entry = tmin > 0.0 ? tmin : 0.0;
+            double ex = sx + ux * t_entry;
+            double ey = sy + uy * t_entry;
+            double ez = sz + uz * t_entry;
+            /* Nudge into the box if floating-point landed exactly on a
+             * face. The voxel-finding loops below treat boundaries as
+             * left-inclusive. */
+            const double NUDGE = 1e-9;
+            if (ex < xmin) ex = xmin + NUDGE; else if (ex > xmax) ex = xmax - NUDGE;
+            if (ey < ymin) ey = ymin + NUDGE; else if (ey > ymax) ey = ymax - NUDGE;
+            if (ez < zmin) ez = zmin + NUDGE; else if (ez > zmax) ez = zmax - NUDGE;
+
+            stack.x[stack.np] = ex;
+            stack.y[stack.np] = ey;
+            stack.z[stack.np] = ez;
+            stack.u[stack.np] = ux;
+            stack.v[stack.np] = uy;
+            stack.w[stack.np] = uz;
+
+            int ix = 0, iy = 0, iz = 0;
+            while (ix < geometry.isize - 1 && geometry.xbounds[ix+1] <= ex) ix++;
+            while (iy < geometry.jsize - 1 && geometry.ybounds[iy+1] <= ey) iy++;
+            while (iz < geometry.ksize - 1 && geometry.zbounds[iz+1] <= ez) iz++;
+            stack.ir[stack.np] = 1 + ix
+                                   + iy * geometry.isize
+                                   + iz * geometry.isize * geometry.jsize;
+            stack.wt[stack.np] = 1.0;
+            stack.dnear[stack.np] = 0.0;
+            accepted = 1;
+        }
+        if (!accepted) {
+            /* Failed to hit the phantom after the rejection budget; emit
+             * a zero-weight particle that will deposit nothing but keeps
+             * the history-counter advancing. */
+            stack.x[stack.np] = source.source_pos[0];
+            stack.y[stack.np] = source.source_pos[1];
+            stack.z[stack.np] = source.source_pos[2];
+            stack.u[stack.np] = source.beam_axis[0];
+            stack.v[stack.np] = source.beam_axis[1];
+            stack.w[stack.np] = source.beam_axis[2];
+            stack.ir[stack.np] = 0;
+            stack.wt[stack.np] = 0.0;
+            stack.dnear[stack.np] = 0.0;
+        }
+        return;
+    }
+
     /* Set particle position. First obtain a random position in the rectangle
      defined by the collimator */
     double rxyz = 0.0;
