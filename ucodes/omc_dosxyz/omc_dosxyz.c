@@ -384,6 +384,21 @@ struct Source {
     double iso[3];            /* cm, IEC frame */
     double cright[3];         /* in-beam +x basis (unit, perp beam_axis) */
     double cup[3];            /* in-beam +y basis (unit, perp beam_axis) */
+
+    /* IAEA phase-space mode (qdc Phase 2 slice 2f). When phsp_active
+     * is set, particle properties (type / energy / position-in-iso-
+     * plane / direction / weight) come from a phsp file rather than
+     * the analytic spectrum sampler. The same rotated-beam basis
+     * (iso, cright, cup, beam_axis) transforms phsp coordinates into
+     * the MVompMC voxel-grid frame; the same ray-box intersection
+     * locates the phantom entry voxel.
+     *
+     * Supports the canonical 32-byte little-endian record described
+     * in qdc's docs/phase-space.md. */
+    int     phsp_active;
+    FILE   *phsp_fp;
+    long long phsp_total_records;
+    long long phsp_records_read;
 };
 struct Source source;
 
@@ -650,6 +665,21 @@ void initSource() {
         printf("\t x (cm) = %f, y (cm) = %f\n", source.xsize, source.ysize);
     }
 
+    /* Slice 2f phase-space mode is keyed off `source type = phase_space`
+     * + a `phsp file = <path>` pointing at the IAEAheader. Initialised
+     * lazily below; rotated-beam basis (set after this) is shared. */
+    source.phsp_active = 0;
+    source.phsp_fp = NULL;
+    source.phsp_total_records = 0;
+    source.phsp_records_read = 0;
+    char source_type_buf[BUFFER_SIZE];
+    int phsp_requested = 0;
+    if (getInputValue(source_type_buf, "source type") == 1) {
+        if (strcmp(source_type_buf, "phase_space") == 0) {
+            phsp_requested = 1;
+        }
+    }
+
     /* Optional rotated-beam mode (qdc Phase 2 slice 2e). Activated if a
      * `source position` key is present. All vectors are in the same IEC
      * frame as the phantom voxel grid. */
@@ -703,14 +733,95 @@ void initSource() {
         }
     }
 
+    /* Slice 2f: open the phsp pair if `source type = phase_space`. The
+     * rotated-beam basis above is required; the analytic sampler is
+     * bypassed in initHistory when phsp_active is set. */
+    if (phsp_requested) {
+        if (!source.rotated_beam) {
+            printf("phase_space mode requires a rotated-beam basis "
+                   "(source position / isocenter / collimator right / "
+                   "collimator up).\n");
+            exit(EXIT_FAILURE);
+        }
+        char phsp_header[BUFFER_SIZE];
+        if (getInputValue(phsp_header, "phsp file") != 1) {
+            printf("phase_space mode: missing 'phsp file' key.\n");
+            exit(EXIT_FAILURE);
+        }
+        FILE *fh = fopen(phsp_header, "r");
+        if (fh == NULL) {
+            printf("Unable to open phsp header file: %s\n", phsp_header);
+            exit(EXIT_FAILURE);
+        }
+        long long total_records = -1;
+        int record_length = -1;
+        char section[64] = "";
+        char hline[1024];
+        while (fgets(hline, sizeof(hline), fh) != NULL) {
+            char *t = hline;
+            while (*t == ' ' || *t == '\t') t++;
+            char *end = t + strlen(t);
+            while (end > t && (end[-1] == '\n' || end[-1] == '\r' ||
+                               end[-1] == ' ' || end[-1] == '\t')) end--;
+            *end = '\0';
+            if (*t == '\0' || *t == '#' || *t == '!') continue;
+            if (*t == '$') {
+                char *colon = strchr(t, ':');
+                if (colon) *colon = '\0';
+                snprintf(section, sizeof(section), "%s", t + 1);
+                continue;
+            }
+            if (strcmp(section, "RECORD_LENGTH") == 0) {
+                record_length = atoi(t);
+            } else if (strcmp(section, "PARTICLES") == 0) {
+                total_records = atoll(t);
+            }
+        }
+        fclose(fh);
+        if (record_length != 32 || total_records <= 0) {
+            printf("phsp header %s: only $RECORD_LENGTH=32 with positive "
+                   "$PARTICLES is supported.\n", phsp_header);
+            exit(EXIT_FAILURE);
+        }
+        /* Derive .IAEAphsp path. */
+        char phsp_data[BUFFER_SIZE];
+        size_t hlen = strlen(phsp_header);
+        const char *hsuffix = ".IAEAheader";
+        size_t slen = strlen(hsuffix);
+        if (hlen < slen ||
+            strcmp(phsp_header + hlen - slen, hsuffix) != 0) {
+            printf("phsp header path must end with '.IAEAheader': %s\n",
+                   phsp_header);
+            exit(EXIT_FAILURE);
+        }
+        memcpy(phsp_data, phsp_header, hlen - slen);
+        memcpy(phsp_data + (hlen - slen), ".IAEAphsp", strlen(".IAEAphsp") + 1);
+        source.phsp_fp = fopen(phsp_data, "rb");
+        if (source.phsp_fp == NULL) {
+            printf("Unable to open phsp data file: %s\n", phsp_data);
+            exit(EXIT_FAILURE);
+        }
+        source.phsp_active = 1;
+        source.phsp_total_records = total_records;
+        source.phsp_records_read = 0;
+        if (verbose_flag) {
+            printf("Phase-space mode enabled (%lld records).\n",
+                   source.phsp_total_records);
+        }
+    }
+
     return;
 }
 
 void cleanSource() {
-    
+
     free(source.cdfinv1);
     free(source.cdfinv2);
-    
+    if (source.phsp_fp != NULL) {
+        fclose(source.phsp_fp);
+        source.phsp_fp = NULL;
+    }
+
     return;
 }
 
@@ -1076,6 +1187,128 @@ void initHistory() {
      calculations */
     score.ensrc += ein;
            
+    /* Slice 2f: phase-space mode. Read one phsp record, transform from
+     * the iso-plane basis into the MVompMC voxel-grid frame, then run
+     * the same ray-box-intersect-plus-region-index logic as rotated-
+     * beam mode. */
+    if (source.phsp_active) {
+        if (source.phsp_records_read >= source.phsp_total_records) {
+            /* Phsp exhausted before histories ran out. Rewind so the
+             * file can be re-used for the remaining histories. */
+            fseek(source.phsp_fp, 0L, SEEK_SET);
+            source.phsp_records_read = 0;
+        }
+        unsigned char rbuf[32];
+        if (fread(rbuf, 1, sizeof(rbuf), source.phsp_fp) != sizeof(rbuf)) {
+            printf("Short read on phsp data file at record %lld.\n",
+                   source.phsp_records_read);
+            exit(EXIT_FAILURE);
+        }
+        source.phsp_records_read++;
+
+        unsigned char type_byte = rbuf[0];
+        int phsp_type = type_byte & 0x7F;
+        int w_negative = (type_byte & 0x80) ? 1 : 0;
+        float fE, fx, fy, fu, fv, fweight;
+        memcpy(&fE,      rbuf + 4,  4);
+        memcpy(&fx,      rbuf + 8,  4);
+        memcpy(&fy,      rbuf + 12, 4);
+        memcpy(&fu,      rbuf + 16, 4);
+        memcpy(&fv,      rbuf + 20, 4);
+        memcpy(&fweight, rbuf + 24, 4);
+
+        /* Override charge / energy from phsp; the spectrum sampling
+         * earlier in initHistory is discarded for this particle. */
+        switch (phsp_type) {
+            case 1: stack.iq[stack.np] = 0;  break;  /* photon */
+            case 2: stack.iq[stack.np] = -1; break;  /* electron */
+            case 3: stack.iq[stack.np] = 1;  break;  /* positron */
+            default:
+                printf("Unsupported phsp particle type %d at record %lld.\n",
+                       phsp_type, source.phsp_records_read - 1);
+                exit(EXIT_FAILURE);
+        }
+        if (stack.iq[stack.np] != 0) {
+            stack.e[stack.np] = (double)fE + RM;
+        } else {
+            stack.e[stack.np] = (double)fE;
+        }
+
+        double w_phsp = sqrt(fmax(0.0, 1.0 - (double)fu*fu - (double)fv*fv));
+        if (w_negative) w_phsp = -w_phsp;
+        double px = fx, py = fy;
+        double tx = source.iso[0] + px*source.cright[0] + py*source.cup[0];
+        double ty = source.iso[1] + px*source.cright[1] + py*source.cup[1];
+        double tz = source.iso[2] + px*source.cright[2] + py*source.cup[2];
+        double ux = (double)fu*source.cright[0] + (double)fv*source.cup[0]
+                  + w_phsp*source.beam_axis[0];
+        double uy = (double)fu*source.cright[1] + (double)fv*source.cup[1]
+                  + w_phsp*source.beam_axis[1];
+        double uz = (double)fu*source.cright[2] + (double)fv*source.cup[2]
+                  + w_phsp*source.beam_axis[2];
+
+        /* Ray-box intersect from (tx,ty,tz) along (ux,uy,uz). For phsp
+         * particles, the iso-plane sample point may already be inside
+         * the phantom AABB; tmin clamps to 0 in that case. */
+        double xmin = geometry.xbounds[0];
+        double xmax = geometry.xbounds[geometry.isize];
+        double ymin = geometry.ybounds[0];
+        double ymax = geometry.ybounds[geometry.jsize];
+        double zmin = geometry.zbounds[0];
+        double zmax = geometry.zbounds[geometry.ksize];
+        double tmin = -1e300, tmax = 1e300;
+        for (int axis = 0; axis < 3; axis++) {
+            double o = (axis == 0) ? tx : (axis == 1) ? ty : tz;
+            double d = (axis == 0) ? ux : (axis == 1) ? uy : uz;
+            double lo = (axis == 0) ? xmin : (axis == 1) ? ymin : zmin;
+            double hi = (axis == 0) ? xmax : (axis == 1) ? ymax : zmax;
+            if (fabs(d) < 1e-12) {
+                if (o < lo || o > hi) { tmax = -1.0; break; }
+                continue;
+            }
+            double t1 = (lo - o) / d;
+            double t2 = (hi - o) / d;
+            if (t1 > t2) { double s = t1; t1 = t2; t2 = s; }
+            if (t1 > tmin) tmin = t1;
+            if (t2 < tmax) tmax = t2;
+            if (tmax < tmin) break;
+        }
+        if (tmax < 0.0 || tmax < tmin) {
+            /* Particle's ray misses the phantom — discard. */
+            stack.x[stack.np] = tx; stack.y[stack.np] = ty; stack.z[stack.np] = tz;
+            stack.u[stack.np] = ux; stack.v[stack.np] = uy; stack.w[stack.np] = uz;
+            stack.ir[stack.np] = 0;
+            stack.wt[stack.np] = 0.0;
+            stack.dnear[stack.np] = 0.0;
+            return;
+        }
+        double t_entry = tmin > 0.0 ? tmin : 0.0;
+        double ex = tx + ux * t_entry;
+        double ey = ty + uy * t_entry;
+        double ez = tz + uz * t_entry;
+        const double NUDGE = 1e-9;
+        if (ex < xmin) ex = xmin + NUDGE; else if (ex > xmax) ex = xmax - NUDGE;
+        if (ey < ymin) ey = ymin + NUDGE; else if (ey > ymax) ey = ymax - NUDGE;
+        if (ez < zmin) ez = zmin + NUDGE; else if (ez > zmax) ez = zmax - NUDGE;
+
+        stack.x[stack.np] = ex;
+        stack.y[stack.np] = ey;
+        stack.z[stack.np] = ez;
+        stack.u[stack.np] = ux;
+        stack.v[stack.np] = uy;
+        stack.w[stack.np] = uz;
+        int ix = 0, iy = 0, iz = 0;
+        while (ix < geometry.isize - 1 && geometry.xbounds[ix+1] <= ex) ix++;
+        while (iy < geometry.jsize - 1 && geometry.ybounds[iy+1] <= ey) iy++;
+        while (iz < geometry.ksize - 1 && geometry.zbounds[iz+1] <= ez) iz++;
+        stack.ir[stack.np] = 1 + ix
+                               + iy * geometry.isize
+                               + iz * geometry.isize * geometry.jsize;
+        stack.wt[stack.np] = (double)fweight;
+        stack.dnear[stack.np] = 0.0;
+        return;
+    }
+
     /* Rotated-beam mode (slice 2e). Sample on the iso plane, ray-box
      * intersect into the phantom AABB, set entry voxel's region. */
     if (source.rotated_beam) {
