@@ -29,6 +29,20 @@
 #include <string.h>
 #include <time.h>
 
+/* Single definitions for the global structs declared as `extern` in
+ * ompmc.h. Previously these were tentative definitions in the header
+ * (relying on -fcommon), which GCC 10+ rejects with "multiple
+ * definition" link errors. */
+struct Photon photon_data;
+struct Rayleigh rayleigh_data;
+struct Pair pair_data;
+struct Electron electron_data;
+struct Spin spin_data;
+struct Mscat mscat_data;
+struct Media media;
+struct Pegs pegs_data;
+struct Region region;
+
 /*******************************************************************************
 * Definitions for Monte Carlo simulation of particle transport 
 *******************************************************************************/
