@@ -1576,9 +1576,20 @@ int main (int argc, char **argv) {
     /* Parse input file and print key,value pairs (test) */
     parseInputFile(input_file);
 
-    /* Get information of OpenMP environment */
+    /* Get information of OpenMP environment. Honour OMP_NUM_THREADS
+     * if it is set in the environment; otherwise default to all
+     * available processors. This lets external callers (e.g. byte-
+     * identity regression tests) force serial execution without
+     * recompiling. */
 #ifdef _OPENMP
     int omp_size = omp_get_num_procs();
+    const char *omp_env = getenv("OMP_NUM_THREADS");
+    if (omp_env != NULL && *omp_env != '\0') {
+        int requested = atoi(omp_env);
+        if (requested > 0) {
+            omp_size = requested;
+        }
+    }
     printf("Number of OpenMP threads: %d\n", omp_size);
     omp_set_num_threads(omp_size);
 #else
