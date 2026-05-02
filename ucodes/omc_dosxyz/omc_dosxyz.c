@@ -1490,7 +1490,20 @@ void initHistory() {
 }
 
 /******************************************************************************/
-/* omc_dosxyz main function */
+/* omc_dosxyz main function.
+ *
+ * When compiled with -DOMC_DOSXYZ_AS_LIBRARY (set by clinical-dosecalc's
+ * CMake when linking this translation unit into qdc_core), the symbol
+ * `main` is renamed to `omc_dosxyz_main` via the macro below so the
+ * function can coexist with a hosting program's own main(). The
+ * standalone executable build leaves this token alone, so the binary
+ * still has a real main() and ./omc_dosxyz keeps working unchanged.
+ *
+ * The header omc_dosxyz.h declares the renamed symbol so callers can
+ * invoke the kernel without going through fork+exec. */
+#ifdef OMC_DOSXYZ_AS_LIBRARY
+#define main omc_dosxyz_main
+#endif
 int main (int argc, char **argv) {
     
     /* Execution time measurement */
