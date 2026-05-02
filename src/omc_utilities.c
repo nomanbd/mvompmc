@@ -61,21 +61,29 @@ double omc_get_time() {
 
 /* Parse a configuration file */
 void parseInputFile(char *input_file) {
-    
+
     char buf[BUFFER_SIZE];      // support lines up to 120 characters
-    
+
+    /* Reset the cumulative input index: parseInputFile may be called
+     * multiple times in the same process (when this code is linked
+     * as a library and a host such as qdc runs many beams in
+     * succession). Without this, the second call would keep writing
+     * past the prior run's high-water mark and overflow the fixed
+     * input_items[] buffer. */
+    input_idx = 0;
+
     /* Make space for the new string */
     const char *extension = INPUT_EXT;
     char *file_name = malloc(strlen(input_file) + strlen(extension) + 1);
     strcpy(file_name, input_file);
     strcat(file_name, extension); /* add the extension */
-    
+
     FILE *fp;
     if ((fp = fopen(file_name, "r")) == NULL) {
         printf("Unable to open file: %s\n", file_name);
         exit(EXIT_FAILURE);
     }
-    
+
     while (fgets(buf, BUFFER_SIZE , fp) != NULL) {
         /* Jumps lines labeled with #, together with only white
          spaced or empty ones. */

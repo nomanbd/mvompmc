@@ -1627,17 +1627,20 @@ static void omc_dosxyz_handle_sigint(int sig) {
 #endif
 int main (int argc, char **argv) {
 
-    /* Reset cancellation state for this run. The flag is process-
-     * global, but for any single invocation we want a clean slate. */
+#ifdef OMC_DOSXYZ_AS_LIBRARY
+    /* Library mode (linked into a host process such as qdc): the host
+     * owns signal handling and the cancel-flag lifecycle. We must
+     * NOT reset omc_dosxyz_cancel here — a SIGINT delivered between
+     * beams would race with this reset and get lost. We also must
+     * not install our own SIGINT handler, because doing so would
+     * clobber whatever cancel-aware handler the host installed. */
+#else
+    /* Standalone executable: we own the cancel-flag lifecycle, and
+     * we install our own handler so Ctrl+C in a terminal flips the
+     * flag instead of killing the process mid-simulation. */
     omc_dosxyz_cancel = 0;
-    /* Install SIGINT handler so Ctrl+C in a terminal flips the flag
-     * instead of killing the process mid-simulation. The handler is
-     * idempotent — setting it twice (e.g. when the host already had
-     * one) just installs ours. The default-action handler is
-     * inherited from whatever the caller had before this; we don't
-     * try to restore it on exit because main() is the kernel's
-     * entire lifecycle for this process. */
     signal(SIGINT, omc_dosxyz_handle_sigint);
+#endif
 
     /* Execution time measurement */
     double tbegin;
@@ -1653,6 +1656,25 @@ int main (int argc, char **argv) {
      * --dump-dose-fd N. Used by qdc's in-process integration to
      * receive the dose without parsing the .3ddose text file. */
     int dump_dose_fd = -1;
+
+    /* Reset getopt state so a second call (when this kernel is linked
+     * as a library and the host invokes us repeatedly) re-scans argv
+     * from the beginning. Without this, optind retains its value
+     * from the previous call, getopt_long sees no options, and
+     * input_file stays NULL — strlen(NULL) inside parseInputFile
+     * then segfaults.
+     *
+     * BSD libc (macOS) needs optreset=1 in addition to optind=1;
+     * glibc accepts optind=0 as a stronger "fully reinitialise"
+     * signal. We do both to cover all platforms we ship to. */
+#ifdef __GLIBC__
+    optind = 0;
+#else
+    optind = 1;
+#  ifdef __APPLE__
+    optreset = 1;
+#  endif
+#endif
 
     while (1) {
         static struct option long_options[] =
@@ -1754,13 +1776,13 @@ int main (int argc, char **argv) {
     
     /* Read geometry information from phantom file and initialize geometry */
     initPhantom();
-    
+
     /* With number of media and media names initialize the medium data */
     initMediaData();
-    
+
     /* Initialize radiation source */
     initSource();
-    
+
     /* Initialize data on a region-by-region basis */
     initRegions();
 
@@ -1943,6 +1965,18 @@ int main (int argc, char **argv) {
     /* Get total execution time */
     printf("Total execution time : %8.5f seconds\n",
            (omc_get_time() - tbegin));
-    
-    exit (EXIT_SUCCESS);
+
+    /* Flush stdout/stderr before returning so any output buffered
+     * during the run is visible to the host process (matters when
+     * the kernel is called as a library and the host might segfault
+     * mid-run on a follow-up call). */
+    fflush(stdout);
+    fflush(stderr);
+
+    /* Return rather than exit() so the kernel is callable as a
+     * library: a hosting process such as qdc gets control back
+     * after the simulation finishes, can call us again for the
+     * next beam, and runs its own cleanup at process exit. The
+     * standalone binary's wrapping shell sees the same 0 status. */
+    return EXIT_SUCCESS;
 }
