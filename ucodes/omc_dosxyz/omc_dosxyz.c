@@ -26,9 +26,11 @@
 
 #include <ctype.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #ifdef _OPENMP
     #include <omp.h>
@@ -1490,6 +1492,112 @@ void initHistory() {
 }
 
 /******************************************************************************/
+/* omc_dosxyz_dump_dose: serialise the post-simulation dose grid to a
+ * file descriptor in a small, fixed binary format.
+ *
+ * Intended to be called once, after omc_dosxyz_main returns 0 in the
+ * caller's child process — at that point `geometry` and `score` are
+ * fully populated and `outputResults()` has accumulated the per-voxel
+ * dose and relative uncertainty into `score.accum_endep` /
+ * `score.accum_endep2`. The function reads only existing globals; it
+ * does not allocate or modify simulation state.
+ *
+ * Format (little-endian; values are doubles unless noted):
+ *
+ *   char     magic[4]   = "QDD1"
+ *   uint32_t version    = 1
+ *   int32_t  nx, ny, nz
+ *   double   spacing_cm[3]   (xbounds[1]-xbounds[0], y..., z...)
+ *   double   origin_cm[3]    (xbounds[0], ybounds[0], zbounds[0])
+ *   double   dose[nx*ny*nz]  (X fastest, Z slowest — same as Dose3d)
+ *   double   unc[nx*ny*nz]   (relative uncertainty in [0..1])
+ *
+ * Returns 0 on success, -1 if any write() returns short. The caller
+ * is responsible for closing fd. */
+int omc_dosxyz_dump_dose(int fd) {
+    int isize = geometry.isize;
+    int jsize = geometry.jsize;
+    int ksize = geometry.ksize;
+    int64_t n = (int64_t)isize * jsize * ksize;
+    int imax = isize;
+    int ijmax = isize * jsize;
+
+    /* Header. */
+    {
+        unsigned char hdr[4 + 4 + 12 + 24 + 24];
+        size_t off = 0;
+        memcpy(hdr + off, "QDD1", 4); off += 4;
+        uint32_t v = 1;
+        memcpy(hdr + off, &v, 4); off += 4;
+        int32_t dims[3] = {(int32_t)isize, (int32_t)jsize, (int32_t)ksize};
+        memcpy(hdr + off, dims, sizeof(dims)); off += sizeof(dims);
+        double spacing[3] = {
+            geometry.xbounds[1] - geometry.xbounds[0],
+            geometry.ybounds[1] - geometry.ybounds[0],
+            geometry.zbounds[1] - geometry.zbounds[0],
+        };
+        memcpy(hdr + off, spacing, sizeof(spacing)); off += sizeof(spacing);
+        double origin[3] = {
+            geometry.xbounds[0],
+            geometry.ybounds[0],
+            geometry.zbounds[0],
+        };
+        memcpy(hdr + off, origin, sizeof(origin)); off += sizeof(origin);
+        ssize_t wrote = write(fd, hdr, off);
+        if (wrote < 0 || (size_t)wrote != off) return -1;
+    }
+
+    /* Dose values, in the same loop order as outputResults() (X
+     * fastest, Z slowest), so the receiver sees Dose3d-compatible
+     * ordering with no permutation. The kernel's `score` array is
+     * 1-indexed (irl = 1 + ix + iy*imax + iz*ijmax); we walk it
+     * voxel-by-voxel and stream a small chunk at a time so the
+     * function works against pipes with bounded buffers. */
+    enum { CHUNK = 4096 };
+    double buf[CHUNK];
+    int64_t streamed = 0;
+
+    /* dose[] */
+    streamed = 0;
+    while (streamed < n) {
+        int64_t batch = (n - streamed) < CHUNK ? (n - streamed) : CHUNK;
+        for (int64_t k = 0; k < batch; k++) {
+            int64_t lin = streamed + k;
+            int iz = (int)(lin / ijmax);
+            int rem = (int)(lin - (int64_t)iz * ijmax);
+            int iy = rem / imax;
+            int ix = rem - iy * imax;
+            int irl = 1 + ix + iy * imax + iz * ijmax;
+            buf[k] = score.accum_endep[irl];
+        }
+        ssize_t want = (ssize_t)(batch * sizeof(double));
+        ssize_t got = write(fd, buf, (size_t)want);
+        if (got < 0 || got != want) return -1;
+        streamed += batch;
+    }
+
+    /* uncertainty[] */
+    streamed = 0;
+    while (streamed < n) {
+        int64_t batch = (n - streamed) < CHUNK ? (n - streamed) : CHUNK;
+        for (int64_t k = 0; k < batch; k++) {
+            int64_t lin = streamed + k;
+            int iz = (int)(lin / ijmax);
+            int rem = (int)(lin - (int64_t)iz * ijmax);
+            int iy = rem / imax;
+            int ix = rem - iy * imax;
+            int irl = 1 + ix + iy * imax + iz * ijmax;
+            buf[k] = score.accum_endep2[irl];
+        }
+        ssize_t want = (ssize_t)(batch * sizeof(double));
+        ssize_t got = write(fd, buf, (size_t)want);
+        if (got < 0 || got != want) return -1;
+        streamed += batch;
+    }
+    return 0;
+}
+
+/******************************************************************************/
 /* omc_dosxyz main function.
  *
  * When compiled with -DOMC_DOSXYZ_AS_LIBRARY (set by clinical-dosecalc's
@@ -1515,7 +1623,12 @@ int main (int argc, char **argv) {
     int c;
     char *input_file = NULL;
     char *output_file = NULL;
-    
+    /* When non-negative, dump the post-simulation dose grid to this fd
+     * in the QDD1 binary format (see omc_dosxyz_dump_dose). Set via
+     * --dump-dose-fd N. Used by qdc's in-process integration to
+     * receive the dose without parsing the .3ddose text file. */
+    int dump_dose_fd = -1;
+
     while (1) {
         static struct option long_options[] =
         {
@@ -1526,19 +1639,20 @@ int main (int argc, char **argv) {
              We distinguish them by their indices. */
             {"input",  required_argument, 0, 'i'},
             {"output",    required_argument, 0, 'o'},
+            {"dump-dose-fd", required_argument, 0, 'D'},
             {0, 0, 0, 0}
         };
-        
+
         /* getopt_long stores the option index here. */
         int option_index = 0;
-        
-        c = getopt_long(argc, argv, "i:o:",
+
+        c = getopt_long(argc, argv, "i:o:D:",
                          long_options, &option_index);
-        
+
         /* Detect the end of the options. */
         if (c == -1)
             break;
-        
+
         switch (c) {
             case 0:
                 /* If this option set a flag, do nothing else now. */
@@ -1549,23 +1663,27 @@ int main (int argc, char **argv) {
                     printf (" with arg %s", optarg);
                 printf ("\n");
                 break;
-                
+
             case 'i':
                 input_file = malloc(strlen(optarg) + 1);
                 strcpy(input_file, optarg);
                 printf ("option -i with value `%s'\n", input_file);
                 break;
-                
+
             case 'o':
                 output_file = malloc(strlen(optarg) + 1);
                 strcpy(output_file, optarg);
                 printf ("option -o with value `%s'\n", output_file);
                 break;
-            
+
+            case 'D':
+                dump_dose_fd = atoi(optarg);
+                break;
+
             case '?':
                 /* getopt_long already printed an error message. */
                 break;
-                
+
             default:
                 exit(EXIT_FAILURE);
         }
@@ -1726,7 +1844,17 @@ int main (int argc, char **argv) {
     
     int iout = 1;   /* i.e. deposit mean dose per particle fluence */
     outputResults(output_file, iout, nperbatch, nbatch);
-    
+
+    /* If a host process asked for the post-simulation dose grid via
+     * --dump-dose-fd N, serialise it now BEFORE cleanScore() frees the
+     * accumulators. */
+    if (dump_dose_fd >= 0) {
+        if (omc_dosxyz_dump_dose(dump_dose_fd) != 0) {
+            fprintf(stderr, "omc_dosxyz: dose dump to fd %d failed.\n",
+                    dump_dose_fd);
+        }
+    }
+
     /* Cleaning */
     cleanPhantom();
     cleanPhoton();
