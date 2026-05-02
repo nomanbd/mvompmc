@@ -26,6 +26,7 @@
 
 #include <ctype.h>
 #include <math.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1609,11 +1610,35 @@ int omc_dosxyz_dump_dose(int fd) {
  *
  * The header omc_dosxyz.h declares the renamed symbol so callers can
  * invoke the kernel without going through fork+exec. */
+
+/* Cooperative-cancellation flag (slice 5c). Set via SIGINT handler
+ * installed below; the batch loop checks it at each boundary and
+ * stops cleanly. Hosting processes (e.g. qdc) may also set it
+ * directly to drive cancellation programmatically. */
+volatile sig_atomic_t omc_dosxyz_cancel = 0;
+
+static void omc_dosxyz_handle_sigint(int sig) {
+    (void)sig;
+    omc_dosxyz_cancel = 1;
+}
+
 #ifdef OMC_DOSXYZ_AS_LIBRARY
 #define main omc_dosxyz_main
 #endif
 int main (int argc, char **argv) {
-    
+
+    /* Reset cancellation state for this run. The flag is process-
+     * global, but for any single invocation we want a clean slate. */
+    omc_dosxyz_cancel = 0;
+    /* Install SIGINT handler so Ctrl+C in a terminal flips the flag
+     * instead of killing the process mid-simulation. The handler is
+     * idempotent — setting it twice (e.g. when the host already had
+     * one) just installs ours. The default-action handler is
+     * inherited from whatever the caller had before this; we don't
+     * try to restore it on exit because main() is the kernel's
+     * entire lifecycle for this process. */
+    signal(SIGINT, omc_dosxyz_handle_sigint);
+
     /* Execution time measurement */
     double tbegin;
     tbegin = omc_get_time();
@@ -1798,7 +1823,19 @@ int main (int argc, char **argv) {
     printf("Execution time up to this point : %8.2f seconds\n",
            (omc_get_time() - tbegin));
     
-    for (int ibatch=0; ibatch<nbatch; ibatch++) {
+    int ibatch;
+    for (ibatch = 0; ibatch < nbatch; ibatch++) {
+        /* Cooperative cancellation point (slice 5c). The flag is set
+         * by SIGINT (Ctrl+C) or by the host directly. Breaking here
+         * — at the top of an unstarted batch — keeps every completed
+         * batch fully accumulated, so the partial dose we write
+         * below is statistically meaningful. */
+        if (omc_dosxyz_cancel) {
+            printf("\nCancellation requested; finalising at batch %d/%d.\n",
+                   ibatch, nbatch);
+            fflush(stdout);
+            break;
+        }
         if (ibatch == 0) {
             /* Print header for information during simulation */
             printf("%-10s\t%-15s\t%-10s\n", "Batch #", "Elapsed time",
@@ -1810,27 +1847,41 @@ int main (int argc, char **argv) {
             /* Print state of current batch */
             printf("%-10d\t%-15.2f\t%-5d%-5d\n", ibatch,
                    (omc_get_time() - tbegin), rng.ixx, rng.jxx);
-            
+
         }
+        /* Stream progress in real time so a host process (or the
+         * user) sees per-batch output as it lands instead of buffered
+         * up to end-of-simulation. */
+        fflush(stdout);
         int ihist;
         #pragma omp parallel for schedule(dynamic)
         for (ihist=0; ihist<nperbatch; ihist++) {
             /* Initialize particle history */
             initHistory();
-            
+
             /* Start electromagnetic shower simulation */
             shower();
         }
-        
+
         /* Accumulate results of current batch for statistical analysis */
         accumEndep();
     }
-    
+    /* Number of batches whose histories actually finished. On a clean
+     * run this equals nbatch; on a cancellation it's the count
+     * iterated past the cancel check. We pass this to outputResults
+     * so the per-voxel mean and variance normalise against the right
+     * denominator. */
+    int completed_batches = ibatch;
+
     /* Print some output and execution time up to this point */
-    printf("Simulation finished\n");
+    if (omc_dosxyz_cancel) {
+        printf("Simulation cancelled\n");
+    } else {
+        printf("Simulation finished\n");
+    }
     printf("Execution time up to this point : %8.2f seconds\n",
            (omc_get_time() - tbegin));
-    
+
     /* Analysis and output of results */
     if (verbose_flag) {
         /* Sum energy deposition in the phantom */
@@ -1841,17 +1892,33 @@ int main (int argc, char **argv) {
         printf("Fraction of incident energy deposited in the phantom: %5.4f\n",
                etot/score.ensrc);
     }
-    
-    int iout = 1;   /* i.e. deposit mean dose per particle fluence */
-    outputResults(output_file, iout, nperbatch, nbatch);
 
-    /* If a host process asked for the post-simulation dose grid via
-     * --dump-dose-fd N, serialise it now BEFORE cleanScore() frees the
-     * accumulators. */
-    if (dump_dose_fd >= 0) {
-        if (omc_dosxyz_dump_dose(dump_dose_fd) != 0) {
-            fprintf(stderr, "omc_dosxyz: dose dump to fd %d failed.\n",
-                    dump_dose_fd);
+    int iout = 1;   /* i.e. deposit mean dose per particle fluence */
+    if (completed_batches < 2) {
+        /* The accumulator's variance estimate divides by
+         * (nbatch - 1), so anything less than 2 completed batches
+         * can't produce a usable .3ddose. Skip the writes — the
+         * caller will see exit code 0 (cancellation is not an
+         * error) and an empty/missing dose file. */
+        fprintf(stderr,
+                "omc_dosxyz: only %d batch(es) completed; skipping dose "
+                "output (need at least 2 for variance estimate).\n",
+                completed_batches);
+    } else {
+        /* nhist arg to outputResults is histories-per-batch (the
+         * per-history fluence divisor); we pass it through unchanged.
+         * Only nbatch shifts to completed_batches so the per-batch
+         * average uses the right denominator on a partial run. */
+        outputResults(output_file, iout, nperbatch, completed_batches);
+
+        /* If a host process asked for the post-simulation dose grid via
+         * --dump-dose-fd N, serialise it now BEFORE cleanScore() frees the
+         * accumulators. */
+        if (dump_dose_fd >= 0) {
+            if (omc_dosxyz_dump_dose(dump_dose_fd) != 0) {
+                fprintf(stderr, "omc_dosxyz: dose dump to fd %d failed.\n",
+                        dump_dose_fd);
+            }
         }
     }
 
